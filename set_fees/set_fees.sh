@@ -8,7 +8,7 @@ fees_def='
     100:0
     101:0
     102:0
-    1001:0
+    10001:0
 '
 genesis_path=''
 libsovtoken_path='/usr/lib/libsovtoken.so'
@@ -91,7 +91,7 @@ function check_install_sovtoken {
             fi
         done
         if [ "$installed" = false ] ; then
-            /usr/bin/apt-get install -y $(gen_pkgs_to_install ${nsp}${vers_inst_str})
+            /usr/bin/apt-get install --no-install-recommends -y $(gen_pkgs_to_install ${nsp}${vers_inst_str})
             pkgs_installed=true
         fi
     done
@@ -120,11 +120,11 @@ function gen_pkgs_to_install {
 }
 
 function pre_check {
-    if [ ! -f "$(which indy-cli)" ] ; then
+    if [ ! -f "$(which indy-cli)" -a "$setup_sovtoken_only" != true ] ; then
         echo "Error: Can't find indy-cli"
         exit 1
     fi
-    if [ ! -f "$libsovtoken_path" ] ; then
+    if [ ! -f "$libsovtoken_path" -a "$setup_sovtoken_only" != true ] ; then
         echo "Error: Can't find /usr/lib/libsovtoken.so"
         exit 1
     fi
@@ -135,6 +135,12 @@ function pre_check {
 }
 
 function restart_indy_node {
+    if grep -q indy_node /etc/supervisord.conf > /dev/null 2>&1 ; then
+        if pgrep /usr/local/bin/start_indy_node > /dev/null; then
+            echo "Indy node appears to be running with supervisord, please restart manually"
+        fi
+        return
+    fi
     local sctl_indy_node=( $(/bin/systemctl list-unit-files | grep enabled | grep indy | grep -v control | grep -o '^indy.\w\+') )
     if [ "${#sctl_indy_node[@]}" -eq 0 ] ; then
         echo "No indy-node systemctl files found, aborting indy-node restart."
@@ -291,7 +297,7 @@ function set_fees {
     echo "## Will sign SET_FEES transaction: $to_sign"
     process_multi_sig_txn "$to_sign"
     # Show current fees
-    echo "## Displaying current fees after out change"
+    echo "## Displaying current fees after our change"
     echo -e "${cli_context}\ndid use $primary_did\nledger get-fees payment_method=sov" | run_indy_cmd | grep -E '\-\+|\|'
 }
 
@@ -299,6 +305,7 @@ function seed_trustees {
     echo "## Seeding trustees into wallet"
     local cur_dids=$(echo -e "wallet open ${wallet_name} key=${wallet_key}\ndid list" |run_indy_cmd '' true)
     local cur_did_array=()
+    local add_did_tries=0
     local cli_context
     local cli_context_did
     local cli_context_did_ledger
@@ -355,15 +362,26 @@ function seed_trustees {
             new_did=${new_did_out[0]}
             new_did_verkey=${new_did_out[1]}
             echo "## Added new DID: ${new_did} to the wallet: ${wallet_name}"
-            echo "## Adding new DID: ${new_did} with verkey: ${new_did_verkey} to the ledger pool: ${pool_name}"
-            ledger_out=$(run_indy_cmd "${cli_context_did_ledger}ledger nym did=${new_did} verkey=${new_did_verkey} role=TRUSTEE")
-            if [ $? -ne 0 ] ; then
-                echo "## ERROR: Could not add did: ${new_did} to the ledger pool: ${pool_name}"
-                echo "--------------"
-                echo "$ledger_out"
-                echo "--------------"
-                exit 1
-            fi
+            add_did_tries=0
+            while [ $add_did_tries -le 3 ] ; do
+                let add_did_tries+=1
+                echo "## Adding new DID(try=${add_did_tries}): ${new_did} with verkey: ${new_did_verkey} to the ledger pool: ${pool_name}"
+                ledger_out=$(run_indy_cmd "${cli_context_did_ledger}ledger nym did=${new_did} verkey=${new_did_verkey} role=TRUSTEE")
+                if [ $? -ne 0 ] ; then
+                    if [ $add_did_tries -ge 3 ] ; then
+                        echo "## ERROR: Could not add did: ${new_did} to the ledger pool: ${pool_name}"
+                        echo "--------------"
+                        echo "$ledger_out"
+                        echo "--------------"
+                        exit 1
+                    else
+                        echo "## ERROR: Could not add did: ${new_did} to the ledger pool: ${pool_name}" >&2
+                        echo "## Retrying adding of DID: ${new_did} with verkey: ${new_did_verkey} to the ledger pool: ${pool_name}"
+                    fi
+                else
+                    break
+                fi
+            done
         else
             echo "## DID: ${s_did} already exists in wallet, skipping" >&2
         fi
